@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resource-queue"
+version = "0.1.0"
+description = "A Windows job queue that learns what your builds and tests cost."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Fergus O'Reilly"}]
+classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/fergo5002/resource-queue"
+
+[project.scripts]
+resource-queue = "resource_queue.resources:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
