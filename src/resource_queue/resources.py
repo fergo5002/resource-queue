@@ -1,9 +1,10 @@
 """Machine-wide scheduler for disposable foreground engineering jobs.
 
-Child-tree peak memory and CPU time are measured through a Windows Job Object
-and remembered to inform the next admission decision. Shared WSL VM growth is an estimate. Jobs that fit
-run side by side; scheduler.py makes the decisions. No packages, resident service, raw command logging or
-process-name killing. The job object owns descendants. The SQLite queue survives a crash.
+Child-tree peak memory and CPU time are measured through a Windows Job Object, or on macOS and Linux by
+sampling the command's session, process group and descendants (posix.py), and remembered to inform the
+next admission decision. Shared WSL VM growth is an estimate. Jobs that fit run side by side;
+scheduler.py makes the decisions. No packages, resident service, raw command logging or process-name
+killing. The job owns descendants. The SQLite queue survives a crash.
 """
 
 
@@ -48,6 +49,9 @@ import sqlite3
 import subprocess
 
 
+import signal
+
+
 import sys
 
 
@@ -57,7 +61,7 @@ import time
 import uuid
 
 
-from . import config, scheduler
+from . import config, posix, scheduler
 
 
 GIB = 1024 ** 3
@@ -67,7 +71,17 @@ def state_dir():
     override = os.environ.get('RESOURCE_QUEUE_HOME')
     if override:
         return Path(override)
-    return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'resource-queue'
+    if os.name == 'nt':
+        return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'resource-queue'
+    if sys.platform == 'darwin':
+        return Path.home() / 'Library' / 'Application Support' / 'resource-queue'
+    return Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'resource-queue'
+
+
+def supported():
+    if os.name == 'nt':
+        return c.sizeof(c.c_void_p) == 8
+    return sys.platform == 'darwin' or sys.platform.startswith('linux')
 
 
 def _kernel():
@@ -82,12 +96,7 @@ def _kernel():
 def identity(pid):
     """Creation identity; None means absent, 'unknown' means preserve ownership."""
     if os.name != 'nt':
-        try:
-            return Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
-        except FileNotFoundError:
-            return None
-        except OSError:
-            return 'unknown'
+        return posix.identity(pid)
     k = _kernel()
     handle = k.OpenProcess(0x1000, False, pid)
     if not handle:
@@ -121,7 +130,8 @@ RUN_FIELDS = ('sig','fkey','repo','label','kind','docker','install','started','w
 SCHEMA = 2  # PRAGMA user_version once migrated; the old code never sets it
 
 
-DOCKER_EXES = {'docker.exe','docker-compose.exe','com.docker.cli.exe','podman.exe'}
+DOCKER_EXES = {'docker.exe','docker-compose.exe','com.docker.cli.exe','podman.exe',
+               'docker','docker-compose','com.docker.cli','podman'}  # without .exe on macOS and Linux
 
 
 WRITE_EVERY_S = 10  # a running row refreshes at least this often (well inside scheduler.STALE_S)
@@ -251,7 +261,11 @@ class Queue:
 
 def memory():
     if os.name != 'nt':
-        return {'available_gib':None, 'commit_fraction':None, 'commit_used_gib':None, 'commit_limit_gib':None}
+        try:
+            return posix.memory()
+        except (OSError, ValueError, KeyError, AttributeError, ZeroDivisionError, subprocess.SubprocessError):
+            # Unreadable memory: the scheduler then allows only lone jobs.
+            return {'available_gib':None, 'commit_fraction':None, 'commit_used_gib':None, 'commit_limit_gib':None}
     class Mem(c.Structure):
         _fields_ = [('length',w.DWORD),('load',w.DWORD)] + [(n,c.c_ulonglong) for n in ('total','available','commit_limit','commit_available','virtual','virtual_available','extended')]
     m = Mem()
@@ -366,9 +380,10 @@ def cache_key(state, argv):
 
 
 def own_job():
-    """Attach this wrapper before starting children, so even a launch-time crash is covered."""
+    """Attach this wrapper before starting children, so even a launch-time crash is covered.
+    On macOS and Linux this starts the guard that cleans up if the wrapper dies."""
     if os.name != 'nt':
-        raise RuntimeError('This supervisor currently requires Windows job objects.')
+        return posix.PosixJob()
     class Basic(c.Structure):
         _fields_ = [('process_time',c.c_longlong),('job_time',c.c_longlong),('flags',w.DWORD),('min_ws',c.c_size_t),('max_ws',c.c_size_t),('active',w.DWORD),('affinity',c.c_size_t),('priority',w.DWORD),('scheduling',w.DWORD)]
     class Limits(c.Structure):
@@ -392,10 +407,28 @@ def own_job():
     return handle
 
 
+def start_child(handle, command, env):
+    """Start the command inside the job. A Windows child joins the wrapper's job object on its own."""
+    if isinstance(handle, posix.PosixJob):
+        return handle.start(command, env)
+    return subprocess.Popen(command, env=env)
+
+
+def close_job(handle, child=None, signum=None):
+    """End every process the job owns. On Windows the job object does this when the wrapper exits."""
+    if isinstance(handle, posix.PosixJob):
+        handle.close(child, signum)
+
+
 def job_usage(handle):
     """(current GiB, peak GiB, CPU seconds) of committed memory across every process in the job.
     Observed 29 September 2026: 622 MB peak for two grandchildren allocating 300 MB each; current
-    falls to zero on exit while the peak is kept."""
+    falls to zero on exit while the peak is kept. On macOS and Linux these are sampled (posix.py)."""
+    if isinstance(handle, posix.PosixJob):
+        try:
+            return handle.sample()
+        except (ValueError, subprocess.SubprocessError) as exc:
+            raise OSError(str(exc)) from exc
     class MemUse(c.Structure):
         _fields_ = [('job_memory',c.c_ulonglong),('peak_job_memory',c.c_ulonglong)]
     class Acct(c.Structure):
@@ -413,6 +446,8 @@ def job_usage(handle):
 
 def job_process_names(handle, limit=512):
     """Image names of the processes currently in the job. Only the job's own processes, never the machine's."""
+    if isinstance(handle, posix.PosixJob):
+        return handle.names[:limit]  # from the latest sample, so the process table is read once per loop
     class Ids(c.Structure):
         _fields_ = [('assigned',w.DWORD),('listed',w.DWORD),('ids',c.c_size_t*limit)]
     k = _kernel()
@@ -441,6 +476,35 @@ def is_docker_process(name):
 
 
 FAKE_MEMORY = {'available_gib':64.0, 'commit_fraction':.02, 'commit_used_gib':1.0, 'commit_limit_gib':128.0}
+
+
+class Stopped(Exception):
+    """SIGTERM or SIGHUP reached the wrapper. KeyboardInterrupt plays this part for SIGINT."""
+    def __init__(self, signum):
+        super().__init__(f'stopped by signal {signum}')
+        self.signum = signum
+
+
+def _raise_stopped(signum, frame):
+    raise Stopped(signum)
+
+
+def _children_rusage():
+    if os.name == 'nt':
+        return None
+    import resource
+    return resource.getrusage(resource.RUSAGE_CHILDREN)
+
+
+def _reaped_since(before, after):
+    """(CPU seconds, peak resident GiB) of children the wrapper reaped between two readings, recursively
+    including descendants their parents waited for. A floor for what sampling saw."""
+    if before is None or after is None:
+        return 0.0, 0.0
+    cpu = (after.ru_utime + after.ru_stime) - (before.ru_utime + before.ru_stime)
+    unit = 1 if sys.platform == 'darwin' else 1024   # bytes on macOS, KiB on Linux
+    rss = after.ru_maxrss * unit / GIB if after.ru_maxrss > before.ru_maxrss else 0.0
+    return max(0.0, cpu), rss
 
 
 def run(a):
@@ -474,11 +538,29 @@ def run(a):
                 when = datetime.fromtimestamp(hit['passed']).strftime('%H:%M on %d %b')
                 print(f"Reused pass: this exact code and command passed at {when} (took {hit['wall_s']:.0f} s). Nothing to run.", flush=True)
                 return 0
+    handlers = {}
+    if os.name != 'nt' and _main_thread():
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            handlers[signum] = signal.signal(signum, _raise_stopped)
+    try:
+        return _run_queued(a, queue, birth, command, repo, tree, kind, sig, fkey, pred, label, key, state)
+    finally:
+        for signum, previous in handlers.items():
+            signal.signal(signum, previous)
+
+
+def _main_thread():
+    import threading
+    return threading.current_thread() is threading.main_thread()
+
+
+def _run_queued(a, queue, birth, command, repo, tree, kind, sig, fkey, pred, label, key, state):
     ticket = queue.enqueue(os.getpid(),birth,a.purpose,dict(v=2,sig=sig,fkey=fkey,label=label,repo=repo,tree=tree,**kind,
                            pred_gib=pred['gib'],pred_cpu=pred['cpu'],pred_s=pred['secs'],pred_vm=pred['vm']), policy=a.settings)
     started = time.monotonic()
     record = None
     last_reason, last_message = None, -60
+    job_handle = child = interrupted = None
     try:
         while True:
             waited = time.monotonic()-started
@@ -511,14 +593,17 @@ def run(a):
         print(f"Starting queued job #{ticket}: {a.purpose}" + (f" (waited {waited:.0f} s)" if waited >= 5 else ''),flush=True)
         vm0 = None if a.admission_test else vm_usage()
         t0 = time.time()
-        child = subprocess.Popen(command,env=env)
+        reaped0 = _children_rusage()
+        child = start_child(job_handle, command, env)
         peak = cpu_s = vm_growth = cpu_peak = 0.0
+        # A job object is read every 2 s and loses nothing; sampling must look more often to follow the tree.
+        every = (.2 if a.admission_test else 2) if os.name == 'nt' else (.1 if a.admission_test else .5)
         docker = kind['docker']
         window, last_write, written_cur = (t0, 0.0), 0.0, -1.0
         # Monitoring is best effort throughout: nothing below may cost the job itself.
         while True:
             try:
-                code = child.wait(timeout=.2 if a.admission_test else 2)
+                code = child.wait(timeout=every)
             except subprocess.TimeoutExpired:
                 code = None
             now = time.time()
@@ -551,7 +636,7 @@ def run(a):
             if docker and not kind['docker']:
                 fields['docker'] = kind['docker'] = 1
                 urgent = True
-            if code is None and (urgent or now-last_write >= WRITE_EVERY_S):
+            if code is None and ((urgent and now-last_write >= 1) or now-last_write >= WRITE_EVERY_S):
                 try:
                     queue.update(ticket, **fields)
                     last_write, written_cur = now, cur
@@ -559,6 +644,8 @@ def run(a):
                     pass  # locked: the row goes stale and others budget it at full prediction, which is safe
             if code is not None:
                 break
+        reaped_cpu, reaped_rss = _reaped_since(reaped0, _children_rusage())
+        cpu_s, peak = max(cpu_s, reaped_cpu), max(peak, reaped_rss)
         wall = time.time()-t0
         record = dict(sig=sig,fkey=fkey,repo=repo,label=label,kind='docker' if docker else kind['kind'],docker=docker,install=kind['install'],
                       started=t0,wall_s=round(wall,2),cpu_s=round(cpu_s,1),peak_gib=round(peak,3),vm_gib=round(vm_growth,3) if docker else 0.0,
@@ -570,15 +657,25 @@ def run(a):
             except sqlite3.Error:
                 pass
         return code
+    except KeyboardInterrupt:
+        interrupted = signal.SIGINT
+        raise
+    except Stopped as exc:
+        interrupted = exc.signum
+        raise
     finally:
         try:
-            queue.release(ticket, record)
-        except sqlite3.Error as exc:
-            print(f'Resource control: could not record this run ({exc}); the job result stands.', file=sys.stderr)
+            if job_handle is not None:
+                close_job(job_handle, child, interrupted)
+        finally:
+            try:
+                queue.release(ticket, record)
+            except sqlite3.Error as exc:
+                print(f'Resource control: could not record this run ({exc}); the job result stands.', file=sys.stderr)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='A Windows job queue that learns what your builds and tests cost.')
+    parser = argparse.ArgumentParser(description='A job queue that learns what your builds and tests cost.')
     sub = parser.add_subparsers(dest='action', required=True)
     run_parser = sub.add_parser('run', help='queue a foreground command and supervise its child tree')
     run_parser.add_argument('--purpose', default='engineering validation')
@@ -589,7 +686,7 @@ def main(argv=None):
     config_parser = sub.add_parser('config', help='print the default TOML or initialise the shared policy')
     config_parser.add_argument('--init', action='store_true', help='create config.toml without overwriting it')
     for command_parser in (run_parser, status_parser, config_parser):
-        command_parser.add_argument('--state', help='shared state directory (default: LOCALAPPDATA/resource-queue)')
+        command_parser.add_argument('--state', help='shared state directory (default: the platform\'s local data folder)')
         command_parser.add_argument('--config', help='explicit TOML policy (default: state/config.toml if present)')
     run_parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -608,8 +705,8 @@ def main(argv=None):
         target = Path(args.config) if args.config else directory / 'config.toml'
         args.settings = config.load(target) if args.config or target.exists() else config.Settings()
         config.apply(args.settings)
-        if os.name != 'nt' or c.sizeof(c.c_void_p) != 8:
-            raise RuntimeError('This release requires 64-bit Windows and Python 3.11 or newer.')
+        if not supported():
+            raise RuntimeError('This release supports 64-bit Windows, macOS and Linux.')
         if args.action == 'run':
             import math
             if not math.isfinite(args.timeout) or args.timeout < 0:
@@ -620,6 +717,8 @@ def main(argv=None):
         return 0
     except KeyboardInterrupt:
         return 130
+    except Stopped as exc:
+        return 128 + exc.signum
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         print(f'Resource queue: {exc}', file=sys.stderr)
         return 2

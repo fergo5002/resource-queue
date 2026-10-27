@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -58,7 +59,10 @@ def test_state_override_and_default_use_no_brain_directory(tmp_path, monkeypatch
     assert resources.state_dir() == tmp_path / 'queue'
     monkeypatch.delenv('RESOURCE_QUEUE_HOME')
     monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'local'))
-    assert resources.state_dir() == tmp_path / 'local' / 'resource-queue'
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg'))
+    assert 'brain' not in str(resources.state_dir()).lower()
+    if os.name == 'nt':
+        assert resources.state_dir() == tmp_path / 'local' / 'resource-queue'
 
 
 def test_public_cli_help_excludes_private_adapters():

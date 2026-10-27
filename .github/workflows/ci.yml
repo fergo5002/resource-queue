@@ -1,12 +1,14 @@
-name: Windows tests
+name: Tests
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
         python: ['3.11', '3.14']
     steps:
       - uses: actions/checkout@v4

@@ -1,2 +1,2 @@
-"""A measured resource queue for foreground Windows engineering jobs."""
-__version__ = '0.1.0'
+"""A measured resource queue for foreground engineering jobs on Windows, macOS and Linux."""
+__version__ = '0.2.0'

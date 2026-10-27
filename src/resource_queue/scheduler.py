@@ -32,7 +32,7 @@ _HEAVY = re.compile(r'build|playwright|e2e|browser|mutant|stryker|render|remotio
 _LIGHT = re.compile(r'typecheck|type check|\btsc\b|lint|eslint|prettier|format|biome|openapi|generate|noemit|clippy|\bfmt\b')
 _TARGETED = re.compile(r'\.(?:test|spec)\.[cm]?[jt]sx?$')
 _WORD = re.compile(r'^[a-z0-9][a-z0-9:_.-]{0,23}$')
-_REASONS = ('slots', 'docker', 'worktree', 'order', 'commit', 'memory', 'cpu')
+_REASONS = ('slots', 'docker', 'worktree', 'order', 'pressure', 'commit', 'memory', 'cpu')
 
 
 def _stem(word: str) -> str:
@@ -197,6 +197,7 @@ def plan(rows: list[dict], mem: dict, now: float, vm_gib: float | None = None) -
     commit = mem['commit_used_gib'] + sum(_unrealised(r, now) for r in running) if known else 0.0
     limit = mem['commit_limit_gib'] if known else float('inf')
     cpu = sum(_cpu(r) for r in running)
+    pressure = mem.get('pressure')  # macOS reports its own; Windows and Linux leave this out
     head, out = None, {}
     for w in waiting:
         need = _need(w, vm_gib)
@@ -208,6 +209,8 @@ def plan(rows: list[dict], mem: dict, now: float, vm_gib: float | None = None) -
             why = 'worktree'
         elif head and now - head['created'] > HEAD_PRIORITY_S:
             why = 'order'
+        elif pressure == 'critical' or (pressure == 'warn' and running):
+            why = 'pressure'
         elif not running:
             why = 'commit' if commit + need > COMMIT_HARD * limit else None  # progress: low RAM only pages
         elif commit + need > COMMIT_SHARED * limit:
@@ -224,7 +227,7 @@ def plan(rows: list[dict], mem: dict, now: float, vm_gib: float | None = None) -
             free -= need
             commit += need
             cpu += _cpu(w)
-        elif head is None and why in ('slots', 'commit', 'memory', 'cpu'):
+        elif head is None and why in ('slots', 'pressure', 'commit', 'memory', 'cpu'):
             head = w
     return out
 
@@ -239,6 +242,7 @@ def describe(rows: list[dict], ticket: int, reason: str, mem: dict, now: float, 
         'memory': f'Waiting for memory: needs about {need:.1f} GiB, {max(free, 0):.1f} GiB free after the reserve and {len(running)} running.',
         'cpu': f'Waiting for CPU: {len(running)} running jobs are using most of the {CPU_BUDGET}-thread budget.',
         'commit': 'Waiting: committed memory would pass the safe limit.',
+        'pressure': f"Waiting: the system reports {mem.get('pressure')} memory pressure.",
         'slots': f'Waiting: {MAX_RUNNING} jobs already running.',
         'docker': 'Waiting: another Docker job is running, and Docker jobs go one at a time.',
         'worktree': 'Waiting: another job is using this worktree (installs and identical jobs run alone).',
