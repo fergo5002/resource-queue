@@ -184,7 +184,9 @@ def test_runs_record_measurements_without_argv_or_env(tmp_path):
     run = db.execute('SELECT label, peak_gib, wall_s, exit FROM runs').fetchall()
     dump = '\n'.join(db.iterdump())
     db.close()
-    assert len(run) == 1 and run[0][0] == 'python alloc.py' and run[0][1] >= 0.18 and run[0][2] > 0 and run[0][3] == 0
+    from resource_queue import scheduler
+    expected = scheduler._stem(sys.executable) + ' alloc.py'   # python on Windows, python3.11 and the like elsewhere
+    assert len(run) == 1 and run[0][0] == expected and run[0][1] >= 0.18 and run[0][2] > 0 and run[0][3] == 0
     assert 'abc123secret' not in dump and 'zzz-env-secret' not in dump
 
 
@@ -197,7 +199,6 @@ def test_test_override_cannot_be_used_accidentally(tmp_path):
     assert '123' not in p.stdout
 
 
-@pytest.mark.skipif(os.name != 'nt',reason='Windows job object')
 def test_killed_supervisor_takes_only_its_child_with_it(tmp_path):
     script = Path(resources.__file__).parents[1] / 'queue_cli.py'
     child = tmp_path/'child.py'
@@ -222,6 +223,43 @@ def test_killed_supervisor_takes_only_its_child_with_it(tmp_path):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+def test_background_process_left_by_the_command_ends_with_it(tmp_path):
+    """The command exits and leaves a background process behind. Like a job object closing, the wrapper ends it."""
+    script = Path(resources.__file__).parents[1] / 'queue_cli.py'
+    child = tmp_path / 'child.py'
+    child.write_text('import os,subprocess,sys,pathlib\n'
+                     'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+                     'pathlib.Path(sys.argv[1]).write_text(str(g.pid))\nsys.exit(7)')
+    marker = tmp_path / 'pid'
+    p = subprocess.run([sys.executable, str(script), 'run', '--admission-test', '--state', str(tmp_path), '--',
+                        sys.executable, str(child), str(marker)], env=_env(RESOURCE_QUEUE_TEST='1'), timeout=60)
+    assert p.returncode == 7
+    pid = int(marker.read_text())
+    deadline = time.time() + 10
+    while resources.identity(pid) not in (None,) and time.time() < deadline:
+        time.sleep(.05)
+    assert resources.identity(pid) is None
+    assert resources.Queue(tmp_path/'queue.db').rows() == []
+
+
+def test_measurements_include_grandchildren_and_their_cpu(tmp_path):
+    """Two grandchildren hold 300 MB each at the same time, and a third burns CPU then exits."""
+    script = Path(resources.__file__).parents[1] / 'queue_cli.py'
+    grand = tmp_path / 'grand.py'
+    grand.write_text('import sys,time\nif sys.argv[1] == "mem":\n    b = bytearray(300*1024*1024); time.sleep(1.5)\n'
+                     'else:\n    t = time.process_time()\n    while time.process_time() - t < 1: pass')
+    child = tmp_path / 'child.py'
+    child.write_text('import subprocess,sys\nps=[subprocess.Popen([sys.executable, sys.argv[1], w]) for w in ("mem", "mem", "cpu")]\n[p.wait() for p in ps]')
+    p = subprocess.run([sys.executable, str(script), 'run', '--admission-test', '--state', str(tmp_path), '--purpose', 'grandchildren',
+                        '--', sys.executable, str(child), str(grand)], env=_env(RESOURCE_QUEUE_TEST='1'), capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    import sqlite3
+    db = sqlite3.connect(tmp_path/'queue.db')
+    peak, cpu = db.execute('SELECT peak_gib, cpu_s FROM runs').fetchone()
+    db.close()
+    assert peak >= 0.55 and cpu >= 0.9
 
 
 def _git(repo, *args):
