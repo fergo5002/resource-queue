@@ -636,7 +636,7 @@ def _run_queued(a, queue, birth, command, repo, tree, kind, sig, fkey, pred, lab
             if docker and not kind['docker']:
                 fields['docker'] = kind['docker'] = 1
                 urgent = True
-            if code is None and (urgent or now-last_write >= WRITE_EVERY_S):
+            if code is None and ((urgent and now-last_write >= 1) or now-last_write >= WRITE_EVERY_S):
                 try:
                     queue.update(ticket, **fields)
                     last_write, written_cur = now, cur
@@ -664,12 +664,14 @@ def _run_queued(a, queue, birth, command, repo, tree, kind, sig, fkey, pred, lab
         interrupted = exc.signum
         raise
     finally:
-        if job_handle is not None:
-            close_job(job_handle, child, interrupted)
         try:
-            queue.release(ticket, record)
-        except sqlite3.Error as exc:
-            print(f'Resource control: could not record this run ({exc}); the job result stands.', file=sys.stderr)
+            if job_handle is not None:
+                close_job(job_handle, child, interrupted)
+        finally:
+            try:
+                queue.release(ticket, record)
+            except sqlite3.Error as exc:
+                print(f'Resource control: could not record this run ({exc}); the job result stands.', file=sys.stderr)
 
 
 def main(argv=None):

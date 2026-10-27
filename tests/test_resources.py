@@ -272,6 +272,8 @@ def _repo(tmp_path):
     _git(repo, 'init', '-q')
     _git(repo, 'config', 'user.email', 't@example.com')
     _git(repo, 'config', 'user.name', 't')
+    _git(repo, 'config', 'maintenance.auto', 'false')   # newer git otherwise runs background maintenance after a commit
+    _git(repo, 'config', 'gc.auto', '0')
     (repo / 'a.txt').write_text('one')
     (repo / '.gitignore').write_text('ignored/\n')
     _git(repo, 'add', '-A')

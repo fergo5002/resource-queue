@@ -174,8 +174,9 @@ time.sleep(60)
 '''
 
 
-@pytest.mark.parametrize('signum, code', [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)])
-def test_a_signal_to_the_wrapper_reaches_the_job_then_ends_it(tmp_path, signum, code):
+@pytest.mark.parametrize('name, code', [('SIGINT', 130), ('SIGTERM', 143), ('SIGHUP', 129)])
+def test_a_signal_to_the_wrapper_reaches_the_job_then_ends_it(tmp_path, name, code):
+    signum = getattr(signal, name)   # by name: Windows has no SIGHUP, and collection must not fail there
     p = _sigkill_scenario(tmp_path, SIGNALLED)
     try:
         pid = int(_wait_for(tmp_path / 'pids'))
@@ -250,3 +251,111 @@ def test_a_spike_shorter_than_a_sample_still_counts_once_reaped(tmp_path):
     peak = db.execute('SELECT peak_gib FROM runs').fetchone()[0]
     db.close()
     assert peak >= 0.28
+
+
+class _FakeChild:
+    def __init__(self, pid, returncode=None):
+        self.pid, self.returncode = pid, returncode
+
+    def poll(self):
+        return self.returncode
+
+
+def _job_with(monkeypatch, tables, usages):
+    """A guardless job fed scripted process tables and usage readings, one per sample."""
+    from resource_queue import posix
+    feed = iter(tables)
+    current = {}
+    def fake_processes():
+        current['table'] = next(feed)
+        return current['table']
+    monkeypatch.setattr(posix, 'processes', fake_processes)
+    monkeypatch.setattr(posix, 'usage', lambda pid: usages.get(pid))
+    monkeypatch.setattr(posix, 'identity', lambda pid: next((p.birth for p in current.get('table', []) if p.pid == pid), None))
+    job = posix.PosixJob(guard=False)
+    job.root, job.root_birth, job.child = 100, 'b100', _FakeChild(100)
+    job.owned[100] = 'b100'
+    return job
+
+
+def test_cpu_of_a_grandchild_is_not_counted_twice_when_its_parent_also_exits(monkeypatch):
+    """make (100) runs gcc (101), which runs cc1 (102). cc1 and gcc both exit inside one interval;
+    make reaps gcc, so make's reaped-children time already holds cc1's."""
+    from resource_queue.posix import Proc
+    make, gcc, cc1 = Proc(100, 1, 100, 100, 'b100', 'make'), Proc(101, 100, 100, 100, 'b101', 'gcc'), Proc(102, 101, 100, 100, 'b102', 'cc1')
+    usages = {100: (0, 0, 1.0), 101: (0, 0, 0.5), 102: (0, 0, 3.0)}
+    job = _job_with(monkeypatch, [[make, gcc, cc1], [make]], usages)
+    assert job.sample()[2] == pytest.approx(4.5)
+    usages[100] = (0, 0, 1.0 + 0.5 + 3.0)   # make's own time plus gcc's, which includes cc1's
+    assert job.sample()[2] == pytest.approx(4.5)
+
+
+def test_cpu_of_an_orphan_that_exits_is_kept(monkeypatch):
+    from resource_queue.posix import Proc
+    root, orphan = Proc(100, 1, 100, 100, 'b100', 'sh'), Proc(103, 1, 103, 103, 'b103', 'daemon')
+    job = _job_with(monkeypatch, [[root, orphan], [root]], {100: (0, 0, 1.0), 103: (0, 0, 2.0)})
+    job.owned[103] = 'b103'
+    assert job.sample()[2] == pytest.approx(3.0)
+    assert job.sample()[2] == pytest.approx(3.0)
+
+
+def test_a_reused_root_pid_after_reaping_is_never_adopted(monkeypatch):
+    """The command was reaped and its pid now leads an unrelated new session. Neither is ours."""
+    from resource_queue.posix import Proc
+    stranger, follower = Proc(100, 1, 100, 100, 'other', 'stranger'), Proc(104, 100, 100, 100, 'b104', 'follower')
+    job = _job_with(monkeypatch, [[stranger, follower]] * 2, {})
+    job.root_birth = None   # even when the command exited before its birth could be read
+    job.owned.clear()
+    job.child.returncode = 0
+    assert job.members() == []
+
+
+def test_group_members_are_adopted_while_the_command_is_unreaped_even_without_its_birth(monkeypatch):
+    from resource_queue.posix import Proc
+    leftover = Proc(105, 1, 100, 100, 'b105', 'bg')
+    job = _job_with(monkeypatch, [[leftover]], {})
+    job.root_birth = None
+    job.owned.clear()
+    assert [p.pid for p in job.members()] == [105]
+
+
+def test_a_signal_during_launch_waits_until_the_command_is_owned(monkeypatch):
+    from resource_queue import posix
+    sleeper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    class Boom(Exception):
+        pass
+    def handler(n, f):
+        raise Boom()
+    previous = signal.signal(signal.SIGTERM, handler)
+    def popen(*args, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)   # lands mid-launch
+        return sleeper
+    monkeypatch.setattr(posix.subprocess, 'Popen', popen)
+    job = posix.PosixJob(guard=False)
+    try:
+        with pytest.raises(Boom):
+            job.start(['ignored'], env=None)
+        assert job.root == sleeper.pid and job.owned.get(sleeper.pid)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        sleeper.kill()
+        sleeper.wait()
+
+
+def test_the_queue_row_is_released_even_if_cleanup_is_interrupted(tmp_path, monkeypatch):
+    from argparse import Namespace
+    from resource_queue import config
+    monkeypatch.delenv('RESOURCE_QUEUE_JOB', raising=False)
+    monkeypatch.setenv('RESOURCE_QUEUE_TEST', '1')
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(resources, 'close_job', interrupted)
+    args = Namespace(command=[sys.executable, '-c', 'pass'], purpose='cleanup', state=str(tmp_path),
+                     admission_test=True, cache=False, timeout=10, settings=config.Settings())
+    with pytest.raises(KeyboardInterrupt):
+        resources.run(args)
+    import sqlite3
+    db = sqlite3.connect(tmp_path / 'queue.db')
+    assert db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 0
+    assert db.execute('SELECT COUNT(*) FROM runs').fetchone()[0] == 1
+    db.close()

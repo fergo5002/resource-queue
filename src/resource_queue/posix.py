@@ -56,13 +56,19 @@ class _RusageV4(c.Structure):
 _LIB = {}
 
 
+def _libsystem():
+    if 'system' not in _LIB:
+        _LIB['system'] = c.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    return _LIB['system']
+
+
 def _libproc():
     if 'proc' not in _LIB:
         lib = c.CDLL('/usr/lib/libproc.dylib', use_errno=True)
         lib.proc_pidinfo.argtypes = [c.c_int, c.c_int, c.c_uint64, c.c_void_p, c.c_int]
         lib.proc_listallpids.argtypes = [c.c_void_p, c.c_int]
         lib.proc_pid_rusage.argtypes = [c.c_int, c.c_int, c.c_void_p]
-        system = c.CDLL('/usr/lib/libSystem.B.dylib')
+        system = _libsystem()
 
         class Timebase(c.Structure):
             _fields_ = [('numer', c.c_uint32), ('denom', c.c_uint32)]
@@ -170,9 +176,10 @@ def _linux_usage(pid):
         status = Path(f'/proc/{pid}/status').read_text()
     except (OSError, ValueError):
         return None
-    kb = {k: int(v) for k, v in re.findall(r'^(RssAnon|VmSwap|VmHWM):\s+(\d+) kB', status, re.M)}
+    kb = {k: int(v) for k, v in re.findall(r'^(RssAnon|VmSwap):\s+(\d+) kB', status, re.M)}
     cpu = sum(int(x) for x in f[11:15]) / _TICK   # utime, stime, cutime, cstime
-    return (kb.get('RssAnon', 0) + kb.get('VmSwap', 0)) * 1024, kb.get('VmHWM', 0) * 1024, cpu
+    # No lifetime peak: VmHWM counts file-backed pages too, which would overstate what the job committed.
+    return (kb.get('RssAnon', 0) + kb.get('VmSwap', 0)) * 1024, None, cpu
 
 
 def identity(pid):
@@ -221,7 +228,7 @@ def linux_memory(meminfo):
 def _sysctl(name, size=8):
     buf = c.create_string_buffer(size)
     length = c.c_size_t(size)
-    system = c.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    system = _libsystem()
     if system.sysctlbyname(name.encode(), buf, c.byref(length), None, c.c_size_t(0)) != 0:
         raise OSError(c.get_errno(), f'sysctl {name}')
     return buf.raw[:length.value]
@@ -243,7 +250,16 @@ def memory():
 
 # ---- the job ----
 
-def _lower_priority():
+STOP_SIGNALS = ('SIGINT', 'SIGTERM', 'SIGHUP')
+
+
+def _stop_signals():
+    return {getattr(signal, name) for name in STOP_SIGNALS}
+
+
+def _child_setup():
+    """Runs in the child between fork and exec: undo the launch-time signal block, then lower priority."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _stop_signals())
     try:
         os.setpriority(os.PRIO_PROCESS, 0, max(NICE, os.getpriority(os.PRIO_PROCESS, 0)))
     except OSError:
@@ -255,7 +271,8 @@ class PosixJob:
 
     def __init__(self, guard=True):
         self.root = None            # pid of the command, which is also its process group and session
-        self.root_birth = None
+        self.root_birth = None      # None when the command exited before it could be read
+        self.child = None           # the wrapper's Popen; None in the guard
         self.owned = {}             # pid -> birth of every process ever adopted
         self.parent = {}            # pid -> ppid at the last sample
         self.cpu_live = {}          # pid -> CPU seconds at the last sample
@@ -283,12 +300,19 @@ class PosixJob:
                 pass
 
     def start(self, command, env):
-        child = subprocess.Popen(command, env=env, start_new_session=True, preexec_fn=_lower_priority)
-        self.root = child.pid
-        self.root_birth = identity(child.pid)
-        self._tell(f'root {child.pid} {self.root_birth}')
-        if self.root_birth not in (None, 'unknown'):
-            self.owned[child.pid] = self.root_birth
+        # A stop signal arriving mid-launch would leave a running command nobody owns. Hold it until
+        # the command is recorded; the child clears the block before exec.
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, _stop_signals())
+        try:
+            child = subprocess.Popen(command, env=env, start_new_session=True, preexec_fn=_child_setup)
+            self.root, self.child = child.pid, child
+            birth = identity(child.pid)
+            self.root_birth = birth if birth not in (None, 'unknown') else None
+            self._tell(f'root {child.pid} {self.root_birth or "-"}')
+            if self.root_birth:
+                self.owned[child.pid] = self.root_birth
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
         return child
 
     def members(self, table=None):
@@ -297,8 +321,7 @@ class PosixJob:
             return []
         table = processes() if table is None else table
         by_pid = {p.pid: p for p in table}
-        holder = by_pid.get(self.root)
-        reused = holder is not None and self.root_birth not in (None, 'unknown') and holder.birth != self.root_birth
+        reused = self._root_reused(by_pid.get(self.root))
         mine = {p.pid for p in table if self.owned.get(p.pid) == p.birth
                 or (not reused and (p.pgid == self.root or p.sid == self.root))}
         mine.discard(os.getpid())
@@ -324,11 +347,19 @@ class PosixJob:
         """(current GiB, peak GiB, CPU seconds) across the job."""
         found = self.members()
         live = {p.pid for p in found}
-        for pid in list(self.cpu_live):
-            if pid not in live:   # exited: its parent absorbs its CPU when it reaps it, unless the parent is not ours
-                if self.parent.get(pid) not in live:
-                    self.cpu_gone += self.cpu_live[pid]
-                del self.cpu_live[pid]
+        gone = [pid for pid in self.cpu_live if pid not in live]
+        for pid in gone:
+            # An exited process's CPU reaches the nearest live ancestor in the job once it is reaped, even
+            # through parents that exited in the same interval. Count it here only if no such ancestor exists.
+            up, seen = self.parent.get(pid), {pid}
+            while up in self.parent and up not in live and up not in seen:
+                seen.add(up)
+                up = self.parent.get(up)
+            if up not in live:
+                self.cpu_gone += self.cpu_live[pid]
+        for pid in gone:
+            del self.cpu_live[pid]
+            self.parent.pop(pid, None)
         cur, single = 0, 0
         for p in found:
             u = usage(p.pid)
@@ -343,11 +374,24 @@ class PosixJob:
         self.peak = max(self.peak, cur / GIB, single / GIB)
         return cur / GIB, self.peak, self.cpu
 
+    def _root_reused(self, holder):
+        """Whether the command's pid, and so its group and session number, may now belong to someone else.
+        Until the wrapper reaps the command its pid is reserved, zombie or not. A group or session number
+        stays reserved while any member lives. So once reaped, any live holder of that pid is a stranger."""
+        if holder is None:
+            return False
+        if self.root_birth is not None and holder.birth != self.root_birth:
+            return True
+        if self.child is not None:
+            return self.child.returncode is not None
+        return self.root_birth is None   # the guard, with no birth to compare: assume the worst
+
     def signal(self, signum):
         """Signal the command's process group, unless its number now belongs to an unrelated new process."""
         if self.root is not None:
             now = identity(self.root)
-            if now not in (None, 'unknown') and self.root_birth not in (None, 'unknown') and now != self.root_birth:
+            holder = None if now in (None, 'unknown') else Proc(self.root, 0, 0, 0, now, '')
+            if self._root_reused(holder):
                 return
             try:
                 os.killpg(self.root, signum)
@@ -406,9 +450,9 @@ def guard_main():
         if word == 'done':
             return 0
         if word == 'root' and len(rest) == 2:
-            job.root, job.root_birth = int(rest[0]), rest[1]
-            if rest[1] not in ('None', 'unknown'):
-                job.owned[job.root] = rest[1]
+            job.root, job.root_birth = int(rest[0]), (None if rest[1] == '-' else rest[1])
+            if job.root_birth:
+                job.owned[job.root] = job.root_birth
         elif word == 'own' and len(rest) == 2:
             job.owned[int(rest[0])] = rest[1]
     # The wrapper is gone without saying so. Nobody else owns these processes now.
