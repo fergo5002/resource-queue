@@ -1,31 +1,40 @@
 # Resource Queue
 
-A job queue for Windows, macOS and Linux that learns what your builds and tests cost.
+Put `resource-queue run --` in front of your builds and tests. It measures what each one really costs, remembers, and from then on runs together only the jobs that fit on your machine.
 
-Wrap a foreground command. The queue measures its child tree, remembers the cost and lets later jobs run together when the predicted budgets fit. No resident service and no runtime dependencies outside Python.
+<img src=".github/readme/resource-queue.gif" alt="Terminal: a typecheck runs through resource-queue with --cache, the identical command is then skipped because that exact code already passed, then the test suite runs" width="860">
+
+For the laptop that's running three agents, a dev server and a test suite at once, and has started to make a noise.
+
+- **It learns.** Each command's peak memory and CPU time are measured across its whole process tree, children and grandchildren included. Next time, it knows.
+- **It packs.** Jobs that fit start straight away and run side by side. Jobs that don't, wait their turn, and a job that's been blocked for two minutes moves to the front.
+- **It cleans up.** When the wrapper exits, however it exits, it takes the command's processes with it. On Windows that's all of them. On macOS and Linux it's every one a sample caught (the details are [below](#what-it-decides-and-how)).
+- **It skips work it's already done.** With `--cache`, a deterministic check that passed on this exact code is not run again.
+- **It's small.** Pure Python, no resident service, no dependencies.
+
+Windows, macOS and Linux.
 
 ## Quick start
 
-Python 3.11 or newer on 64-bit Windows 10 or 11, macOS or Linux. Git is needed for worktree detection and optional caching.
+Python 3.11 or newer, on 64-bit Windows 10 or 11, macOS or Linux. Git is needed for worktree detection and the cache.
 
 ```sh
 git clone https://github.com/fergo5002/resource-queue.git
 cd resource-queue
 python -m pip install .
 resource-queue config --init
+```
+
+`config --init` prints where it put the policy. Open it and set `cpu_budget` for your machine before you queue anything. Then:
+
+```sh
 resource-queue run --purpose "typecheck" -- npm run typecheck
 resource-queue status
 ```
 
-`config --init` prints where it wrote the policy. Edit it before running jobs and set `cpu_budget` for your machine. The defaults are a starting point: four jobs, a 16-thread admission budget and a 1 GiB desktop reserve. They are predictions, not enforced CPU or memory caps.
+Your command's output goes straight to your terminal and you get its exit code back. The queue just decides when it starts.
 
-| System | Default state directory |
-|---|---|
-| Windows | `%LOCALAPPDATA%\resource-queue` |
-| macOS | `~/Library/Application Support/resource-queue` |
-| Linux | `$XDG_STATE_HOME/resource-queue`, else `~/.local/state/resource-queue` |
-
-All terminals use the same state directory by default. `RESOURCE_QUEUE_HOME` or `--state PATH` selects another queue, and `--config PATH` selects a TOML policy. An active queue rejects conflicting budgets. Keep a single queue for jobs sharing a machine.
+## The policy
 
 ```toml
 max_running = 3
@@ -35,23 +44,51 @@ commit_shared = 0.85
 commit_hard = 0.90
 ```
 
-Partial configs inherit defaults. `resource-queue config` prints every setting. Unknown keys, invalid values and missing explicit config files fail before the command launches. `--timeout 900` limits the wait for admission, not the command's runtime. Child output goes straight to your terminal and the wrapper returns its exit code.
+The defaults are four jobs, a 16-thread budget and 1 GiB kept back for the desktop. They're predictions used to decide what starts, not caps on what a job may use. Leave a key out and it keeps the default. `resource-queue config` prints every setting, and an unknown key or bad value fails before anything launches.
 
-## What it does
+Every terminal shares one queue by default:
 
-- Uses a SQLite queue and an atomic admission decision. Jobs that fit can overlap. Installs and identical commands in one worktree run alone.
-- Learns each command's recent peak memory and CPU time across its whole process tree, and closes the tree when the wrapper exits, however it exits. How it does that differs by system (below).
-- Gives an older blocked job priority after two minutes. Dead queue owners are pruned using PID and process start time; uncertain ownership is preserved.
-- Runs children at below-normal priority. It leaves their thread settings alone.
-- Serialises detected Docker jobs. On Windows it also accounts for observed WSL VM growth. The VM is shared, so growth is an estimate and can include unrelated work. This tool doesn't reconfigure WSL or Docker or stop containers.
+| System | State directory |
+|---|---|
+| Windows | `%LOCALAPPDATA%\resource-queue` |
+| macOS | `~/Library/Application Support/resource-queue` |
+| Linux | `$XDG_STATE_HOME/resource-queue`, else `~/.local/state/resource-queue` |
 
-A job running alone may start with low available RAM if projected memory stays below the hard ceiling. The system may page. This is an admission aid for disposable builds and checks, not a memory limiter or a general service supervisor. Background processes spawned by the command are killed when the wrapper exits. Services that were already running, including existing containers, aren't owned by the wrapper.
+`RESOURCE_QUEUE_HOME` or `--state PATH` picks another queue, and `--config PATH` another policy. A running queue rejects a conflicting budget, so keep one queue per machine. `--timeout 900` limits how long a job waits to be admitted, not how long it runs.
 
-### Windows
+## The pass cache
 
-A Windows Job Object. The wrapper joins it before launching anything, the kernel counts peak committed memory and CPU for every process that ever ran in it, and closing or killing the wrapper kills the job. Nothing is sampled, so nothing is missed.
+```sh
+resource-queue run --cache --purpose "typecheck" -- npm run typecheck
+```
 
-### macOS and Linux
+A successful pass is keyed on the Git content of the worktree and the exact arguments, and kept for 14 days. It is never reused outside Git, after the worktree changes, for installs, or for Docker jobs.
+
+The key does not include environment variables, ignored files, tool versions, network responses or anything else outside the repository. Use `--cache` for checks whose answer only depends on the code (typecheck, lint, unit tests) and leave it off for the rest.
+
+## What it decides, and how
+
+- A SQLite queue makes each admission decision atomically. Jobs that fit can overlap. Installs, and identical commands in the same worktree, run alone.
+- Dead queue owners are pruned using PID and process start time. When ownership is uncertain, the job is kept.
+- Children run at below-normal priority. Their thread settings are left alone.
+- Docker jobs run one at a time. On Windows it also accounts for growth in the WSL VM, which is shared, so that figure is an estimate and can include other work. It never reconfigures WSL or Docker or stops containers.
+- A job running alone may start with little free RAM if its projected memory stays under the hard ceiling, so the system may page.
+
+It's an admission aid for disposable builds and checks. It isn't a memory limiter or a service supervisor. Background processes your command spawns are killed when the wrapper exits; services and containers that were already running before it are not its to touch.
+
+<details>
+<summary><b>Windows: a Job Object, so nothing is missed</b></summary>
+
+<br>
+
+The wrapper joins a Windows Job Object before launching anything. The kernel counts peak committed memory and CPU for every process that ever ran in it, and closing or killing the wrapper kills the job. Nothing is sampled, so nothing is missed.
+
+</details>
+
+<details>
+<summary><b>macOS and Linux: sampling, and what it can miss</b></summary>
+
+<br>
 
 There's no Job Object, so the wrapper samples instead, and that's the honest difference: **sampling can miss short spikes that a Job Object catches.**
 
@@ -64,17 +101,13 @@ There's no Job Object, so the wrapper samples instead, and that's the honest dif
 - Docker's memory lives in its VM or daemon, outside the command's tree, and isn't measured here. A Docker job is budgeted at its measured CLI tree plus the fixed `docker_vm_cold` allowance (2 GiB by default), and Docker jobs still run one at a time.
 - No extra packages. macOS uses `libproc` through `ctypes`, Linux reads `/proc`. psutil would have been a new dependency and doesn't expose the per-process lifetime peak footprint that macOS keeps.
 
-## Optional pass cache
+</details>
 
-```sh
-resource-queue run --cache --purpose "typecheck" -- npm run typecheck
-```
+## What it keeps on disk
 
-Use `--cache` only for deterministic checks. It keys successful passes on Git content and exact arguments, and refuses reuse outside Git, after a worktree change, for installs and for detected Docker jobs. Results expire after 14 days. Environment variables, ignored files, tool versions, network responses and external inputs aren't part of the key. Leave caching off when those can change the answer.
+`queue.db` in the state directory (next to `config.toml`, if `config --init` put it there): active jobs, recent measurements and any cached passes. Purposes, working directories, repository identities and short tool labels are recorded. Full command lines and environment variables are not.
 
-## Local data
-
-The state directory holds `queue.db`: active jobs, recent measurements and optional successful-pass records. Full command lines and environment variables aren't recorded. Purposes, working directories, repository identities and short tool labels are recorded. A purpose or plain argument can contain sensitive text, so keep secrets out of labels and don't publish the database. There is no telemetry or upload.
+A purpose or argument can still contain something sensitive, so keep secrets out of labels and don't publish the database. Nothing is uploaded and there's no telemetry.
 
 ## Development
 
@@ -83,6 +116,6 @@ python -m pip install ".[test]"
 python -m pytest
 ```
 
-Tests cover admission rules, config rejection, concurrent processes, descendant measurements, owner crashes, signals, memory pressure and pass-cache behaviour. CI runs the full suite on Windows, macOS and Ubuntu with Python 3.11 and 3.14. Live paid providers and running containers aren't tested.
+The tests cover admission rules, config rejection, concurrent processes, descendant measurement, owner crashes, signals, memory pressure and the cache. CI runs them on Windows, macOS and Ubuntu with Python 3.11 and 3.14. Paid providers and running containers aren't tested.
 
-MIT licensed. Extracted from a personal development scheduler with its account adapters and private configuration removed.
+MIT licensed. Pulled out of the scheduler that runs my own laptop, with the account adapters and private config taken out.
